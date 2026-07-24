@@ -49,7 +49,15 @@ gpu.setResolution(COLS, ROWS)
 -----------------------------------------------------------------------------
 
 local COLOR = { bg=0x0F0F0F, header=0x66CCFF, ok=0x33CC33, warn=0xFFCC00,
-                crit=0xFF3333, dim=0x888888, text=0xFFFFFF, active=0xFF9933 }
+                crit=0xFF3333, dim=0x888888, text=0xFFFFFF, active=0xFF9933,
+                cool=0x66AAFF }
+
+-- Human-friendly number formatting (e.g. 12345 -> "12.3k").
+local function fmt(n)
+  if n >= 1e6 then return string.format("%.2fM", n / 1e6) end
+  if n >= 1e3 then return string.format("%.1fk", n / 1e3) end
+  return tostring(math.floor(n))
+end
 
 -- Query a subnet once and return label -> {name, damage, size, label} (summed).
 local function snapshot(net)
@@ -139,18 +147,40 @@ end
 -- Per-dust active flag for hysteresis (dumping between min and max).
 local dustActive = {}
 
--- Returns:
---   rows    : dashboard rows (dust status)
---   desired : ordered list of { ore=<label>, stack=<oreStack>, urgency=<0..1> }
-local function computeDesired(dustSnap, oreSnap)
-  local rows = {}
-  local oreNeed = {}     -- oreLabel -> { urgency, stack }
-  local order = {}       -- keeps first-seen order of ores
+-- Burst/cooldown settings. Dump an ore for BURST seconds, then pause it for
+-- COOLDOWN seconds to let processing convert the backlog before re-checking.
+-- This keeps any single dump short so we never flood processing, and the
+-- cooldown covers the lag between dumping ore and the dust count rising.
+local BURST    = config.dumpBurst    or 10
+local COOLDOWN = config.dumpCooldown or 60
 
+-- Per-ore dump episode state.
+--   phase       : "idle" | "dumping" | "cooldown"
+--   burstEnd    : uptime() at which the current burst ends
+--   cooldownEnd : uptime() at which cooldown expires
+local oreState = {}
+local function getState(ore)
+  local s = oreState[ore]
+  if not s then
+    s = { phase = "idle", burstEnd = 0, cooldownEnd = 0 }
+    oreState[ore] = s
+  end
+  return s
+end
+
+-- Returns:
+--   rows     : dashboard rows (dust status)
+--   desired  : ordered list of { ore, stack, urgency } we are allowed to dump
+--   oreInfo  : ore -> { status="dumping"|"cooldown", remain }
+local function computeDesired(dustSnap, oreSnap, now)
+  local rows = {}
+  local requested = {}   -- oreLabel -> { urgency, stack }
+  local order = {}       -- first-seen order of requested ores
+
+  -- 1. Hysteresis + gather which ores active dusts want.
   for _, d in ipairs(config.dusts) do
     local have = (dustSnap[d.dust] and dustSnap[d.dust].size) or 0
 
-    -- hysteresis state machine
     if have < d.min then
       dustActive[d.dust] = true
     elseif have >= d.max then
@@ -158,44 +188,93 @@ local function computeDesired(dustSnap, oreSnap)
     end
     local active = dustActive[d.dust] or false
 
-    -- urgency 0..1 (how empty it is relative to min); higher = more urgent
     local urgency = 0
     if d.min > 0 then urgency = math.max(0, math.min(1, (d.min - have) / d.min)) end
 
-    local dumping = {}
     if active then
-      for _, oreLabel in ipairs(d.ores) do
-        local st = oreSnap[oreLabel]
+      for _, ore in ipairs(d.ores) do
+        local st = oreSnap[ore]
         if st and st.size > 0 then
-          dumping[#dumping + 1] = oreLabel
-          local cur = oreNeed[oreLabel]
-          if cur then
-            cur.urgency = math.max(cur.urgency, urgency)
+          local r = requested[ore]
+          if r then
+            r.urgency = math.max(r.urgency, urgency)
           else
-            oreNeed[oreLabel] = { urgency = urgency, stack = st }
-            order[#order + 1] = oreLabel
+            requested[ore] = { urgency = urgency, stack = st }
+            order[#order + 1] = ore
           end
         end
       end
     end
 
     rows[#rows + 1] = { dust = d.dust, have = have, min = d.min, max = d.max,
-                        active = active, dumping = dumping,
-                        oresConfigured = d.ores }
+                        active = active, ores = d.ores }
   end
 
-  -- Build ordered desired list, most urgent first (stable on ties).
+  -- 2. Advance each ore's episode state and decide what may dump.
+  local oreInfo = {}
+  local toProcess = {}
+  for ore in pairs(requested) do toProcess[ore] = true end
+  for ore, s in pairs(oreState) do
+    if s.phase ~= "idle" then toProcess[ore] = true end
+  end
+
+  local allowed = {}
+  for ore in pairs(toProcess) do
+    local s   = getState(ore)
+    local req = requested[ore]
+
+    if not req then
+      -- No active dust wants this ore anymore -> reset.
+      s.phase, s.burstEnd, s.cooldownEnd = "idle", 0, 0
+    else
+      if s.phase == "idle" then
+        s.phase, s.burstEnd = "dumping", now + BURST
+      elseif s.phase == "cooldown" and now >= s.cooldownEnd then
+        s.phase, s.burstEnd = "dumping", now + BURST          -- start a fresh burst
+      elseif s.phase == "dumping" and now >= s.burstEnd then
+        s.phase, s.cooldownEnd = "cooldown", now + COOLDOWN   -- burst done -> rest
+      end
+
+      if s.phase == "dumping" then
+        allowed[ore] = req
+        oreInfo[ore] = { status = "dumping", remain = math.max(0, s.burstEnd - now) }
+      else
+        oreInfo[ore] = { status = "cooldown", remain = math.max(0, s.cooldownEnd - now) }
+      end
+    end
+  end
+
+  -- 3. Ordered desired list from allowed ores, most urgent first.
   local desired = {}
-  for _, lbl in ipairs(order) do
-    desired[#desired + 1] = { ore = lbl, stack = oreNeed[lbl].stack,
-                              urgency = oreNeed[lbl].urgency }
+  for _, ore in ipairs(order) do
+    if allowed[ore] then
+      desired[#desired + 1] = { ore = ore, stack = allowed[ore].stack,
+                                urgency = allowed[ore].urgency }
+    end
   end
   table.sort(desired, function(a, b)
     if a.urgency ~= b.urgency then return a.urgency > b.urgency end
     return a.ore < b.ore
   end)
 
-  return rows, desired
+  -- 4. Build each row's display of what's dumping / cooling.
+  for _, r in ipairs(rows) do
+    r.dumping = {}
+    r.anyDumping = false
+    if r.active then
+      for _, ore in ipairs(r.ores) do
+        local inf = oreInfo[ore]
+        if inf and inf.status == "dumping" then
+          r.dumping[#r.dumping + 1] = ore
+          r.anyDumping = true
+        elseif inf and inf.status == "cooldown" then
+          r.dumping[#r.dumping + 1] = ore .. (" (cd %ds)"):format(math.ceil(inf.remain))
+        end
+      end
+    end
+  end
+
+  return rows, desired, oreInfo
 end
 
 -- Assign the desired ores to the slot pool, clearing everything not desired.
@@ -252,12 +331,6 @@ end
 -- Dashboard
 -----------------------------------------------------------------------------
 
-local function fmt(n)
-  if n >= 1e6 then return string.format("%.2fM", n / 1e6) end
-  if n >= 1e3 then return string.format("%.1fk", n / 1e3) end
-  return tostring(n)
-end
-
 local function pad(s, w)
   s = tostring(s)
   if #s > w then return s:sub(1, w - 1) .. "\xE2\x80\xA6" end
@@ -297,7 +370,8 @@ local function draw(rows, desired, warnings, err)
   for _, r in ipairs(rows) do
     if y >= ROWS then break end
     local status, col
-    if r.active then status, col = "DUMPING", COLOR.active
+    if r.active and r.anyDumping then status, col = "DUMPING", COLOR.active
+    elseif r.active then status, col = "COOLDOWN", COLOR.cool
     elseif r.have < r.min then status, col = "LOW", COLOR.warn
     else status, col = "OK", COLOR.ok end
 
@@ -338,7 +412,7 @@ local function tick()
   local oreSnap, oerr = snapshot(oreNet)
   if not oreSnap then draw({}, {}, {}, "ore subnet: " .. oerr); return end
 
-  local rows, desired = computeDesired(dustSnap, oreSnap)
+  local rows, desired = computeDesired(dustSnap, oreSnap, computer.uptime())
   local warnings = applyToBuses(desired)
   draw(rows, desired, warnings, nil)
 end

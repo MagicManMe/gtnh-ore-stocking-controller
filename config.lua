@@ -48,6 +48,22 @@ config.exportBuses = {
 -- === Timing ================================================================
 config.pollInterval = 5      -- seconds between checks (keep >=3 to be nice to the server)
 
+-- === Burst / cooldown (anti-overshoot) =====================================
+-- Dumped ore must be PROCESSED before the dust count rises, so left running
+-- the controller would keep dumping and massively overshoot. Instead each ore
+-- dumps in short bursts with a rest between them:
+--
+--   dumpBurst    = seconds to dump an ore before pausing it. Effective minimum
+--                  is one pollInterval, so keep it >= pollInterval.
+--   dumpCooldown = seconds to pause that ore afterwards, giving processing time
+--                  to convert the backlog and raise the dust. After it expires,
+--                  if the dust is still low the ore dumps again.
+--
+-- Longer cooldown = gentler / less overshoot but slower to refill. Tune to how
+-- fast your ore processing keeps up.
+config.dumpBurst    = 10
+config.dumpCooldown = 60
+
 -- === The dust -> ore mapping ===============================================
 -- One row per DUST you want to keep stocked.
 --

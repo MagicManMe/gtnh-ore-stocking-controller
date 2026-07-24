@@ -29,11 +29,18 @@ move items between real inventories it physically touches.
 
 ## Install (get the files onto the OC computer)
 
-Option A — pastebin: `pastebin get <code> main.lua` for each file.
-Option B — floppy/drive: copy the four files into a directory on the OC HDD.
-Option C — internet card: `wget <url> main.lua`.
+**Easiest — installer (needs an Internet Card):**
 
-Put `main.lua`, `config.lua`, and `list.lua` in the same directory.
+```
+wget https://raw.githubusercontent.com/MagicManMe/gtnh-ore-stocking-controller/main/installer.lua
+installer
+```
+
+It downloads `main.lua` and `list.lua`, and grabs `config.lua` only if you
+don't already have one (so re-running never overwrites your edited config).
+
+Alternatives: `pastebin get`, or copy the files onto the OC HDD via a floppy/drive.
+Keep `main.lua`, `config.lua`, and `list.lua` in the same directory.
 
 ## Setup
 
@@ -57,6 +64,11 @@ Put `main.lua`, `config.lua`, and `list.lua` in the same directory.
   descriptors by name+damage so it grabs the right item (not "Small Pile of …").
 - `min`/`max` give hysteresis — a dust must climb back to `max` before its ores
   stop dumping, preventing rapid on/off flapping.
+- **Burst/cooldown** prevents over-dumping: an ore dumps for `dumpBurst` seconds,
+  then pauses for `dumpCooldown` seconds so processing can convert the backlog
+  and the dust count can catch up before it dumps again. This covers the lag
+  between dumping ore and the dust level rising. Tune both in `config.lua`;
+  longer cooldown = gentler. The dashboard shows `COOLDOWN` and a countdown.
 - If more ores need dumping than you have export slots, the lowest-priority ones
   wait and the dashboard shows a warning. Add another export bus to raise the
   ceiling.
